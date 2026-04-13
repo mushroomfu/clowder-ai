@@ -5,7 +5,7 @@
 
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -200,6 +200,216 @@ describe('GeminiAgentService (gemini-cli adapter)', () => {
     const spawnOpts = spawnFn.mock.calls[0].arguments[2];
     assert.equal(spawnOpts.env.CAT_CAFE_INVOCATION_ID, 'inv-123');
     assert.equal(spawnOpts.env.CAT_CAFE_CALLBACK_TOKEN, 'tok-456');
+  });
+
+  test('normalizes ZenMux Vertex env and isolates HOME for Gemini CLI api-key mode', async () => {
+    const proc = createMockProcess();
+    const spawnFn = createMockSpawnFn(proc);
+    const service = new GeminiAgentService({ spawnFn, adapter: 'gemini-cli' });
+
+    const callbackEnv = {
+      GEMINI_API_KEY: 'zen-key',
+      GOOGLE_API_KEY: 'zen-key',
+      GEMINI_BASE_URL: 'https://zenmux.ai/api/vertex-ai',
+    };
+
+    const promise = collect(
+      service.invoke('test', {
+        callbackEnv,
+        workingDirectory: '/tmp/clowder-ai',
+      }),
+    );
+    emitGeminiEvents(proc, [{ type: 'init', session_id: 's-zenmux', model: 'auto' }]);
+    await promise;
+
+    const spawnOpts = spawnFn.mock.calls[0].arguments[2];
+    assert.equal(spawnOpts.env.GOOGLE_GENAI_USE_VERTEXAI, 'true');
+    assert.equal(spawnOpts.env.GOOGLE_VERTEX_BASE_URL, 'https://zenmux.ai/api/vertex-ai');
+    assert.equal(spawnOpts.env.GOOGLE_GENAI_API_VERSION, 'v1');
+    assert.equal(spawnOpts.env.GEMINI_BASE_URL, 'https://zenmux.ai/api/vertex-ai');
+    assert.equal(spawnOpts.env.GOOGLE_GENAI_USE_GCA, 'false');
+    assert.equal(spawnOpts.env.GEMINI_CLI_USE_COMPUTE_ADC, 'false');
+    assert.equal(spawnOpts.env.CLOUD_SHELL, 'false');
+    assert.ok(spawnOpts.env.HOME, 'expected isolated HOME for api-key gateway mode');
+    assert.notEqual(spawnOpts.env.HOME, process.env.HOME);
+    assert.match(spawnOpts.env.HOME, /cat-cafe-gemini-home-/);
+  });
+
+  test('reuses isolated HOME across ZenMux Vertex invocations for the same project', async () => {
+    const procA = createMockProcess();
+    const procB = createMockProcess();
+    const procQueue = [procA, procB];
+    const spawnFn = mock.fn(() => procQueue.shift());
+    const service = new GeminiAgentService({ spawnFn, adapter: 'gemini-cli' });
+
+    const callbackEnv = {
+      GEMINI_API_KEY: 'zen-key',
+      GOOGLE_API_KEY: 'zen-key',
+      GEMINI_BASE_URL: 'https://zenmux.ai/api/vertex-ai',
+    };
+
+    const first = collect(
+      service.invoke('first', {
+        callbackEnv,
+        workingDirectory: '/tmp/clowder-ai',
+      }),
+    );
+    emitGeminiEvents(procA, [{ type: 'init', session_id: 's-1', model: 'auto' }]);
+    await first;
+
+    const second = collect(
+      service.invoke('second', {
+        callbackEnv,
+        workingDirectory: '/tmp/clowder-ai',
+      }),
+    );
+    emitGeminiEvents(procB, [{ type: 'init', session_id: 's-2', model: 'auto' }]);
+    await second;
+
+    const firstHome = spawnFn.mock.calls[0].arguments[2].env.HOME;
+    const secondHome = spawnFn.mock.calls[1].arguments[2].env.HOME;
+    assert.ok(firstHome);
+    assert.ok(secondHome);
+    assert.equal(firstHome, secondHome);
+  });
+
+  test('preserves an explicit Gemini API version override for custom Vertex gateways', async () => {
+    const proc = createMockProcess();
+    const spawnFn = createMockSpawnFn(proc);
+    const service = new GeminiAgentService({ spawnFn, adapter: 'gemini-cli' });
+
+    const callbackEnv = {
+      GEMINI_API_KEY: 'zen-key',
+      GOOGLE_API_KEY: 'zen-key',
+      GEMINI_BASE_URL: 'https://zenmux.ai/api/vertex-ai',
+      GOOGLE_GENAI_API_VERSION: 'v1alpha',
+    };
+
+    const promise = collect(
+      service.invoke('test', {
+        callbackEnv,
+        workingDirectory: '/tmp/clowder-ai',
+      }),
+    );
+    emitGeminiEvents(proc, [{ type: 'init', session_id: 's-zenmux-explicit-version', model: 'auto' }]);
+    await promise;
+
+    const spawnOpts = spawnFn.mock.calls[0].arguments[2];
+    assert.equal(spawnOpts.env.GOOGLE_GENAI_API_VERSION, 'v1alpha');
+  });
+
+  test('calls Vertex directly for image-generation Gemini models and emits rich image output', async () => {
+    const spawnFn = createMockSpawnFn(createMockProcess());
+    const fetchFn = mock.fn(async () =>
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  { text: 'Here is the generated image.' },
+                  { inlineData: { mimeType: 'image/png', data: 'AAAA' } },
+                ],
+              },
+            },
+          ],
+          usageMetadata: {
+            promptTokenCount: 11,
+            candidatesTokenCount: 17,
+            totalTokenCount: 28,
+          },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ),
+    );
+    const service = new GeminiAgentService({
+      spawnFn,
+      fetchFn,
+      adapter: 'gemini-cli',
+      model: 'google/gemini-3-pro-image-preview',
+    });
+
+    const callbackEnv = {
+      GEMINI_API_KEY: 'zen-key',
+      GOOGLE_API_KEY: 'zen-key',
+      GEMINI_BASE_URL: 'https://zenmux.ai/api/vertex-ai',
+    };
+
+    const msgs = await collect(
+      service.invoke('generate a slide cover image', {
+        sessionId: 'old-image-session',
+        callbackEnv,
+        workingDirectory: '/tmp/clowder-ai',
+      }),
+    );
+
+    assert.equal(spawnFn.mock.calls.length, 0, 'image models should bypass gemini CLI');
+    assert.equal(fetchFn.mock.calls.length, 1);
+    const [url, init] = fetchFn.mock.calls[0].arguments;
+    assert.equal(
+      url,
+      'https://zenmux.ai/api/vertex-ai/v1/publishers/google/models/gemini-3-pro-image-preview:generateContent',
+    );
+    assert.equal(init.headers['x-goog-api-key'], 'zen-key');
+
+    const body = JSON.parse(init.body);
+    assert.equal(body.tools, undefined, 'direct Vertex path must not send empty CLI tool shells');
+    assert.deepEqual(body.generationConfig.responseModalities, ['TEXT', 'IMAGE']);
+    assert.equal(body.contents[0].parts[0].text, 'generate a slide cover image');
+
+    assert.equal(msgs[0].type, 'session_init');
+    assert.equal(msgs[0].ephemeralSession, true);
+    assert.ok(msgs[0].sessionId.startsWith('vertex-image-'));
+    assert.equal(msgs[1].type, 'text');
+    assert.equal(msgs[1].content, 'Here is the generated image.');
+    assert.deepEqual(msgs[1].metadata?.usage, {
+      inputTokens: 11,
+      outputTokens: 17,
+      totalTokens: 28,
+    });
+    assert.equal(msgs[2].type, 'system_info');
+    const payload = JSON.parse(msgs[2].content);
+    assert.equal(payload.type, 'rich_block');
+    assert.equal(payload.block.kind, 'media_gallery');
+    assert.equal(payload.block.items.length, 1);
+    assert.ok(payload.block.items[0].url.startsWith('data:image/png;base64,AAAA'));
+    assert.equal(msgs[3].type, 'done');
+  });
+
+  test('surfaces direct Vertex image API errors without spawning gemini CLI', async () => {
+    const spawnFn = createMockSpawnFn(createMockProcess());
+    const fetchFn = mock.fn(async () =>
+      new Response(JSON.stringify({ error: { message: 'bad image request' } }), {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    const service = new GeminiAgentService({
+      spawnFn,
+      fetchFn,
+      adapter: 'gemini-cli',
+      model: 'google/gemini-3-pro-image-preview',
+    });
+
+    const callbackEnv = {
+      GEMINI_API_KEY: 'zen-key',
+      GOOGLE_API_KEY: 'zen-key',
+      GEMINI_BASE_URL: 'https://zenmux.ai/api/vertex-ai',
+    };
+
+    const msgs = await collect(
+      service.invoke('generate an image', {
+        callbackEnv,
+        workingDirectory: '/tmp/clowder-ai',
+      }),
+    );
+
+    assert.equal(spawnFn.mock.calls.length, 0);
+    assert.equal(fetchFn.mock.calls.length, 1);
+    assert.equal(msgs[0].type, 'session_init');
+    assert.equal(msgs[1].type, 'error');
+    assert.match(msgs[1].error, /Vertex image API error 400/);
+    assert.equal(msgs[2].type, 'done');
   });
 
   test('maps tool_use events', async () => {

@@ -13,7 +13,7 @@ import type {
 import { createCatId } from '@cat-cafe/shared';
 import { clearBudgetCache } from './cat-budgets.js';
 import { bootstrapCatCatalog, readCatCatalog, resolveCatCatalogPath } from './cat-catalog-store.js';
-import { _resetCachedConfig, loadCatConfig, toAllCatConfigs } from './cat-config-loader.js';
+import { _resetCachedConfig, loadCatConfig, normalizeLegacyImageRuntimeVariant, toAllCatConfigs } from './cat-config-loader.js';
 import { clearVoiceCache } from './cat-voices.js';
 import { resolveProjectTemplatePath } from './project-template-path.js';
 
@@ -190,42 +190,56 @@ function findBreedVariant(catalog: CatCafeConfig, catId: string): BreedVariantLo
 }
 
 function createBreedFromInput(input: RuntimeCatInput): CatBreed {
-  const variantId = `${input.catId}-default`;
+  const normalizedInput = normalizeLegacyImageRuntimeVariant(input);
+  const variantId = `${normalizedInput.catId}-default`;
   return {
-    id: input.breedId?.trim() || input.catId,
-    catId: createCatId(input.catId),
-    name: input.name,
-    displayName: input.displayName,
-    ...(input.nickname != null && input.nickname.trim().length > 0 ? { nickname: input.nickname.trim() } : {}),
-    avatar: input.avatar,
-    color: input.color,
-    mentionPatterns: normalizeMentionPatterns(input.catId, input.mentionPatterns),
-    roleDescription: input.roleDescription,
+    id: normalizedInput.breedId?.trim() || normalizedInput.catId,
+    catId: createCatId(normalizedInput.catId),
+    name: normalizedInput.name,
+    displayName: normalizedInput.displayName,
+    ...(normalizedInput.nickname != null && normalizedInput.nickname.trim().length > 0
+      ? { nickname: normalizedInput.nickname.trim() }
+      : {}),
+    avatar: normalizedInput.avatar,
+    color: normalizedInput.color,
+    mentionPatterns: normalizeMentionPatterns(normalizedInput.catId, normalizedInput.mentionPatterns),
+    roleDescription: normalizedInput.roleDescription,
     defaultVariantId: variantId,
-    ...(input.sessionChain !== undefined ? { features: { sessionChain: input.sessionChain } } : {}),
+    ...(normalizedInput.sessionChain !== undefined ? { features: { sessionChain: normalizedInput.sessionChain } } : {}),
     variants: [
       {
         id: variantId,
         source: 'runtime',
-        clientId: input.clientId,
-        defaultModel: input.defaultModel,
-        mcpSupport: input.mcpSupport,
-        cli: input.cli,
-        ...(input.accountRef != null && input.accountRef.trim().length > 0
-          ? { accountRef: input.accountRef.trim() }
+        clientId: normalizedInput.clientId,
+        defaultModel: normalizedInput.defaultModel,
+        mcpSupport: normalizedInput.mcpSupport,
+        cli: normalizedInput.cli,
+        ...(normalizedInput.accountRef != null && normalizedInput.accountRef.trim().length > 0
+          ? { accountRef: normalizedInput.accountRef.trim() }
           : {}),
-        ...(input.commandArgs && input.commandArgs.length > 0 ? { commandArgs: input.commandArgs } : {}),
-        ...(input.cliConfigArgs && input.cliConfigArgs.length > 0 ? { cliConfigArgs: input.cliConfigArgs } : {}),
-        ...(input.provider ? { provider: input.provider } : {}),
-        ...(input.contextBudget ? { contextBudget: input.contextBudget } : {}),
-        ...(input.personality != null && input.personality.trim().length > 0 ? { personality: input.personality } : {}),
-        ...(input.teamStrengths != null && input.teamStrengths.trim().length > 0
-          ? { teamStrengths: input.teamStrengths.trim() }
+        ...(normalizedInput.commandArgs && normalizedInput.commandArgs.length > 0
+          ? { commandArgs: normalizedInput.commandArgs }
           : {}),
-        ...(input.caution !== undefined
-          ? { caution: input.caution && input.caution.trim().length > 0 ? input.caution.trim() : null }
+        ...(normalizedInput.cliConfigArgs && normalizedInput.cliConfigArgs.length > 0
+          ? { cliConfigArgs: normalizedInput.cliConfigArgs }
           : {}),
-        ...(input.strengths ? { strengths: input.strengths } : {}),
+        ...(normalizedInput.provider ? { provider: normalizedInput.provider } : {}),
+        ...(normalizedInput.contextBudget ? { contextBudget: normalizedInput.contextBudget } : {}),
+        ...(normalizedInput.personality != null && normalizedInput.personality.trim().length > 0
+          ? { personality: normalizedInput.personality }
+          : {}),
+        ...(normalizedInput.teamStrengths != null && normalizedInput.teamStrengths.trim().length > 0
+          ? { teamStrengths: normalizedInput.teamStrengths.trim() }
+          : {}),
+        ...(normalizedInput.caution !== undefined
+          ? {
+              caution:
+                normalizedInput.caution && normalizedInput.caution.trim().length > 0
+                  ? normalizedInput.caution.trim()
+                  : null,
+            }
+          : {}),
+        ...(normalizedInput.strengths ? { strengths: normalizedInput.strengths } : {}),
       },
     ],
   } as unknown as CatBreed;
@@ -408,6 +422,15 @@ export function updateRuntimeCat(projectRoot: string, catId: string, patch: Runt
       delete variant.provider;
     }
   }
+  const normalizedVariant = normalizeLegacyImageRuntimeVariant({
+    clientId: variant.clientId,
+    defaultModel: variant.defaultModel,
+    mcpSupport: variant.mcpSupport,
+    cli: variant.cli,
+  });
+  variant.clientId = normalizedVariant.clientId;
+  variant.mcpSupport = normalizedVariant.mcpSupport;
+  variant.cli = normalizedVariant.cli;
   if (patch.available !== undefined && catalog.version === 2) {
     const existingEntry = catalog.roster[catId];
     catalog.roster = {

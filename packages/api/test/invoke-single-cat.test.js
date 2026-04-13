@@ -3470,6 +3470,77 @@ describe('invokeSingleCat audit events (P1 fix)', () => {
     assert.equal(callbackEnv.OPENROUTER_API_KEY, 'sk-openrouter-key');
   });
 
+  it('F127: legacy anthropic google-model variants inject Gemini env for Vertex api_key accounts', async () => {
+    const { createProviderProfile } = await import('./helpers/create-test-account.js');
+    const root = await mkdtemp(join(tmpdir(), 'f127-legacy-google-compat-'));
+    const apiDir = join(root, 'packages', 'api');
+    await mkdir(apiDir, { recursive: true });
+    await writeFile(join(root, 'pnpm-workspace.yaml'), 'packages:\n  - "packages/*"\n', 'utf-8');
+
+    const zenmuxProfile = await createProviderProfile(root, {
+      provider: 'google',
+      name: 'zenmux-banana',
+      mode: 'api_key',
+      authType: 'api_key',
+      protocol: 'google',
+      baseUrl: 'https://zenmux.ai/api/vertex-ai',
+      apiKey: 'zen-key',
+      models: ['google/gemini-3-pro-image-preview'],
+      setActive: false,
+    });
+
+    const registrySnapshot = catRegistry.getAllConfigs();
+    const originalConfig = catRegistry.tryGet('opus')?.config;
+    assert.ok(originalConfig, 'opus config should exist in registry');
+    const boundCatId = 'legacy-google-compat-test';
+    catRegistry.register(boundCatId, {
+      ...originalConfig,
+      id: boundCatId,
+      mentionPatterns: [`@${boundCatId}`],
+      clientId: 'anthropic',
+      accountRef: zenmuxProfile.id,
+      defaultModel: 'google/gemini-3-pro-image-preview',
+    });
+
+    const optionsSeen = [];
+    const service = {
+      async *invoke(_prompt, options) {
+        optionsSeen.push(options ?? {});
+        yield { type: 'done', catId: boundCatId, timestamp: Date.now() };
+      },
+    };
+
+    const deps = makeDeps();
+    const previousCwd = process.cwd();
+    try {
+      process.chdir(apiDir);
+      const messages = await collect(
+        invokeSingleCat(deps, {
+          catId: boundCatId,
+          service,
+          prompt: 'test legacy google compat',
+          userId: 'user-f127-legacy-google-compat',
+          threadId: 'thread-f127-legacy-google-compat',
+          isLastCat: true,
+        }),
+      );
+      assert.ok(messages.some((m) => m.type === 'done'));
+    } finally {
+      process.chdir(previousCwd);
+      catRegistry.reset();
+      for (const [id, config] of Object.entries(registrySnapshot)) {
+        catRegistry.register(id, config);
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+
+    const callbackEnv = optionsSeen[0]?.callbackEnv ?? {};
+    assert.equal(callbackEnv.GEMINI_API_KEY, 'zen-key');
+    assert.equal(callbackEnv.GOOGLE_API_KEY, 'zen-key');
+    assert.equal(callbackEnv.GEMINI_BASE_URL, 'https://zenmux.ai/api/vertex-ai');
+    assert.equal(callbackEnv.CAT_CAFE_ANTHROPIC_PROFILE_MODE, undefined);
+  });
+
   it('F189: unknown canonical provider/model without ocProviderName writes invocation-scoped OPENCODE_CONFIG and cleans it up', async () => {
     const mod = await import('../dist/domains/cats/services/agents/invocation/invoke-single-cat.js');
     mod._resetOpenCodeKnownModels(new Set(['anthropic/claude-opus-4-6']));

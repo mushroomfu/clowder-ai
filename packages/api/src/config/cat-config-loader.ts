@@ -14,6 +14,7 @@ import type {
   CatFeatures,
   CatId,
   CatVariant,
+  CliConfig,
   CoCreatorConfig,
   ContextBudget,
   MissionHubSelfClaimScope,
@@ -24,6 +25,7 @@ import { type ClientId, createCatId, normalizeCliEffortForProvider } from '@cat-
 import { z } from 'zod';
 import { createModuleLogger } from '../infrastructure/logger.js';
 import { bootstrapCatCatalog, readCatCatalogRaw, resolveCatCatalogPath } from './cat-catalog-store.js';
+import { isFunctionCallingUnsupportedGeminiModel } from './gemini-model-capabilities.js';
 
 const log = createModuleLogger('cat-config');
 
@@ -239,6 +241,45 @@ function readTemplate(templatePath: string): string {
  */
 const ATOMIC_OBJECT_KEYS = new Set(['cli', 'color', 'contextBudget', 'voiceConfig']);
 
+type LegacyImageVariantLike = {
+  clientId?: ClientId;
+  defaultModel?: string;
+  mcpSupport?: boolean;
+  cli?: Partial<CliConfig> | undefined;
+};
+
+export function normalizeLegacyImageRuntimeVariant<T extends LegacyImageVariantLike>(variant: T): T {
+  if (!isFunctionCallingUnsupportedGeminiModel(variant.defaultModel)) return variant;
+
+  const looksLikeLegacyClaudeShim =
+    variant.clientId === 'anthropic' || variant.clientId === 'google' || variant.cli?.command === 'claude';
+  if (!looksLikeLegacyClaudeShim) return variant;
+
+  const defaultArgs = Array.isArray(variant.cli?.defaultArgs) ? [...variant.cli.defaultArgs] : undefined;
+  const nextCli: CliConfig = {
+    command: 'gemini',
+    outputFormat: 'stream-json',
+    ...(defaultArgs && defaultArgs.length > 0 ? { defaultArgs } : {}),
+  };
+
+  return {
+    ...variant,
+    clientId: 'google',
+    mcpSupport: false,
+    cli: nextCli,
+  };
+}
+
+function normalizeLegacyImageCatalog(config: CatCafeConfig): CatCafeConfig {
+  return {
+    ...config,
+    breeds: config.breeds.map((breed) => ({
+      ...breed,
+      variants: breed.variants.map((variant) => normalizeLegacyImageRuntimeVariant(variant)),
+    })),
+  } as unknown as CatCafeConfig;
+}
+
 /**
  * Deep merge two plain objects. `overlay` fields override `base` fields.
  * - Atomic keys (cli, color, etc.): overlay replaces base entirely.
@@ -334,8 +375,10 @@ export function loadCatConfig(filePath?: string): CatCafeConfig {
     throw new Error(`Invalid cat config:\n${issues.join('\n')}`);
   }
 
+  const normalizedConfig = normalizeLegacyImageCatalog(result.data as unknown as CatCafeConfig);
+
   // Validate defaultVariantId references
-  for (const breed of result.data.breeds) {
+  for (const breed of normalizedConfig.breeds) {
     const found = breed.variants.find((v) => v.id === breed.defaultVariantId);
     if (!found) {
       throw new Error(`Breed "${breed.id}": defaultVariantId "${breed.defaultVariantId}" not found in variants`);
@@ -345,7 +388,7 @@ export function loadCatConfig(filePath?: string): CatCafeConfig {
   // Validate that configured mentionPatterns are non-empty.
   // The canonical @catId handle is no longer required — users may replace it
   // with custom aliases via the Hub editor, as long as at least one alias exists.
-  for (const breed of result.data.breeds) {
+  for (const breed of normalizedConfig.breeds) {
     if (breed.mentionPatterns.length === 0) {
       throw new Error(`Breed "${breed.id}": mentionPatterns must have at least one entry`);
     }
@@ -354,7 +397,7 @@ export function loadCatConfig(filePath?: string): CatCafeConfig {
   // Zod output has mutable arrays + plain string catId;
   // CatCafeConfig has readonly arrays + branded CatId.
   // The shapes match at runtime after validation.
-  return result.data as unknown as CatCafeConfig;
+  return normalizedConfig;
 }
 
 export function bootstrapDefaultCatCatalog(templatePath?: string): CatCafeConfig {

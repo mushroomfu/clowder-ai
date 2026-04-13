@@ -22,6 +22,7 @@ import {
 } from '../../../../../config/account-resolver.js';
 import { resolveBoundAccountRefForCat } from '../../../../../config/cat-account-binding.js';
 import { isSessionChainEnabled } from '../../../../../config/cat-config-loader.js';
+import { resolveCompatibleClientId } from '../../../../../config/runtime-client-compat.js';
 import { getContextWindowFallback } from '../../../../../config/context-window-sizes.js';
 import { getSessionStrategy, shouldTakeAction } from '../../../../../config/session-strategy.js';
 import { createModuleLogger } from '../../../../../infrastructure/logger.js';
@@ -693,8 +694,8 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
     // F127 account injection:
     // Members bind to a concrete accountRef (builtin oauth account or generic api_key account).
     const catConfig = catRegistry.tryGet(catId as string)?.config;
-    const provider = catConfig?.clientId;
-    const builtinClient = provider ? resolveBuiltinClientForProvider(provider) : null;
+    const configuredProvider = catConfig?.clientId;
+    const builtinClient = configuredProvider ? resolveBuiltinClientForProvider(configuredProvider) : null;
     const defaultModel = catConfig?.defaultModel?.trim() || undefined;
     // Account resolution, proxy registration, and runtime config always use the
     // runtime root (process.cwd()), NOT thread.projectPath.  catRegistry loads
@@ -716,8 +717,8 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
     const assertCompatibleRuntimeAccount = <T extends { id: string }>(
       account: (T & Parameters<typeof validateRuntimeProviderBinding>[1]) | null,
     ) => {
-      if (!provider || !account) return account;
-      const compatibilityError = validateRuntimeProviderBinding(provider, account, defaultModel);
+      if (!configuredProvider || !account) return account;
+      const compatibilityError = validateRuntimeProviderBinding(configuredProvider, account, defaultModel);
       if (compatibilityError) {
         throw new Error(compatibilityError);
       }
@@ -750,6 +751,21 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
       throw new Error(
         `account "${resolvedAccount.id}" is configured as api_key but has no API key set — ` +
           'add the key in Hub > account settings',
+      );
+    }
+
+    const provider = resolveCompatibleClientId(catConfig, resolvedAccount) ?? configuredProvider;
+    if (configuredProvider && provider && provider !== configuredProvider) {
+      log.warn(
+        {
+          catId,
+          configuredProvider,
+          effectiveProvider: provider,
+          defaultModel: defaultModel ?? null,
+          accountRef: effectiveAccountRef ?? null,
+          baseUrl: resolvedAccount?.baseUrl ?? null,
+        },
+        'Applying runtime client compatibility override',
       );
     }
 

@@ -11,7 +11,7 @@ import fastifyCookie from '@fastify/cookie';
 import cors from '@fastify/cors';
 import fastifyWebsocket from '@fastify/websocket';
 import Fastify from 'fastify';
-import { resolveAnthropicRuntimeProfile, resolveForClient } from './config/account-resolver.js';
+import { resolveAnthropicRuntimeProfile, resolveBuiltinClientForProvider, resolveForClient } from './config/account-resolver.js';
 import { generateCliConfigs, readCapabilitiesConfig } from './config/capabilities/capability-orchestrator.js';
 import { resolveBoundAccountRefForCat } from './config/cat-account-binding.js';
 import { getCatContextBudget } from './config/cat-budgets.js';
@@ -23,6 +23,7 @@ import {
   isCatAvailable,
   toAllCatConfigs,
 } from './config/cat-config-loader.js';
+import { resolveCompatibleClientId } from './config/runtime-client-compat.js';
 import { resolveFrontendBaseUrl, resolveFrontendCorsOrigins } from './config/frontend-origin.js';
 import { initRuntimeOverrides } from './config/session-strategy-overrides.js';
 import { assertStorageReady } from './config/storage-guard.js';
@@ -826,12 +827,30 @@ async function main(): Promise<void> {
   let router!: AgentRouter;
   const syncAgentRegistry = async (configs: Record<string, CatConfig>) => {
     agentRegistry.reset();
+    const projectRoot = findMonorepoRoot(process.cwd());
     for (const [id, config] of Object.entries(configs)) {
       const catId = config.id;
+      const effectiveAccountRef = resolveBoundAccountRefForCat(projectRoot, catId, config);
+      const builtinClient = resolveBuiltinClientForProvider(config.clientId);
+      const runtime = builtinClient ? resolveForClient(projectRoot, builtinClient, effectiveAccountRef) : null;
+      const effectiveClientId = resolveCompatibleClientId(config, runtime) ?? config.clientId;
+      if (effectiveClientId !== config.clientId) {
+        app.log.warn(
+          {
+            catId,
+            configuredClientId: config.clientId,
+            effectiveClientId,
+            defaultModel: config.defaultModel,
+            accountRef: effectiveAccountRef ?? null,
+            baseUrl: runtime?.baseUrl ?? null,
+          },
+          '[api] Applying runtime client compatibility override',
+        );
+      }
       // F32-b P1 fix: do NOT pass model here — let constructors resolve via
       // getCatModel(catId) which respects env override (CAT_*_MODEL > config > fallback)
       let service: AgentService;
-      switch (config.clientId) {
+      switch (effectiveClientId) {
         case 'anthropic':
           service = new ClaudeAgentService({ catId });
           break;

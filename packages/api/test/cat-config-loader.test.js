@@ -285,6 +285,39 @@ describe('cat-config-loader', () => {
       assert.throws(() => loadCatConfig(path), /Invalid cat config/);
     });
 
+    it('normalizes legacy Gemini image variants to google/gemini/no-MCP on load', () => {
+      const config = validConfig();
+      config.breeds[0].id = 'bengal';
+      config.breeds[0].catId = 'banana';
+      config.breeds[0].name = '孟加拉猫';
+      config.breeds[0].displayName = '孟加拉猫';
+      config.breeds[0].mentionPatterns = ['@banana'];
+      config.breeds[0].defaultVariantId = 'banana-default';
+      config.breeds[0].variants[0] = {
+        id: 'banana-default',
+        clientId: 'anthropic',
+        accountRef: 'zenmux-banana',
+        defaultModel: 'google/gemini-3-pro-image-preview',
+        mcpSupport: true,
+        cli: {
+          command: 'claude',
+          outputFormat: 'stream-json',
+          defaultArgs: ['--legacy'],
+          effort: 'high',
+        },
+      };
+
+      const loaded = loadCatConfig(writeTempConfig(config));
+      const cats = toAllCatConfigs(loaded);
+      assert.equal(cats.banana.clientId, 'google');
+      assert.equal(cats.banana.mcpSupport, false);
+      assert.deepEqual(cats.banana.cli, {
+        command: 'gemini',
+        outputFormat: 'stream-json',
+        defaultArgs: ['--legacy'],
+      });
+    });
+
     it('accepts dare provider (F050)', () => {
       const config = validConfig();
       config.breeds.push({

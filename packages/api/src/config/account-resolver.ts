@@ -7,6 +7,7 @@
 import type { AccountConfig, AccountProtocol, ClientId } from '@cat-cafe/shared';
 import { readCatalogAccounts } from './catalog-accounts.js';
 import { readCredential } from './credentials.js';
+import { isFunctionCallingUnsupportedGeminiModel } from './gemini-model-capabilities.js';
 
 // ── Types surviving from provider-profiles.types.ts (F136 Phase 4d) ──
 
@@ -254,9 +255,13 @@ function accountToRuntimeProfile(ref: string, account: AccountConfig, projectRoo
 export function validateRuntimeProviderBinding(
   clientId: ClientId,
   profile: RuntimeProviderProfile,
-  _defaultModel?: string | null,
+  defaultModel?: string | null,
 ): string | null {
-  if (clientId === 'google' && profile.kind !== 'builtin') {
+  if (
+    clientId === 'google' &&
+    profile.kind !== 'builtin' &&
+    !isFunctionCallingUnsupportedGeminiModel(defaultModel ?? undefined)
+  ) {
     return 'client "google" only supports builtin Gemini auth';
   }
   const expectedClient = resolveBuiltinClientForProvider(clientId);

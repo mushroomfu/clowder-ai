@@ -1320,6 +1320,113 @@ describe('cats routes runtime CRUD', { concurrency: false }, () => {
     }
   });
 
+  it('POST/PATCH /api/cats canonicalizes Gemini image gateway members instead of persisting legacy Claude shims', async () => {
+    const projectRoot = createProjectRoot();
+    process.env.CAT_TEMPLATE_PATH = join(projectRoot, 'cat-template.json');
+
+    const { createProviderProfile } = await import('./helpers/create-test-account.js');
+    const zenmuxProfile = await createProviderProfile(projectRoot, {
+      name: 'ZenMux Banana',
+      authType: 'api_key',
+      protocol: 'google',
+      baseUrl: 'https://gateway.zenmux.example/v1',
+      apiKey: 'sk-zenmux-banana',
+      models: ['google/gemini-3-pro-image-preview'],
+    });
+
+    const Fastify = (await import('fastify')).default;
+    const { catsRoutes } = await import('../dist/routes/cats.js');
+
+    const app = Fastify();
+    await app.register(catsRoutes);
+
+    const createRes = await app.inject({
+      method: 'POST',
+      url: '/api/cats',
+      headers: {
+        'content-type': 'application/json',
+        'x-cat-cafe-user': 'codex',
+      },
+      body: JSON.stringify({
+        catId: 'banana',
+        name: '孟加拉猫',
+        displayName: '孟加拉猫',
+        avatar: '/avatars/banana.png',
+        color: { primary: '#cf0a2c', secondary: '#fde6ea' },
+        mentionPatterns: ['@banana'],
+        roleDescription: '图片生成',
+        clientId: 'anthropic',
+        accountRef: zenmuxProfile.id,
+        defaultModel: 'google/gemini-3-pro-image-preview',
+        mcpSupport: true,
+        cli: {
+          command: 'claude',
+          outputFormat: 'stream-json',
+          effort: 'high',
+        },
+      }),
+    });
+
+    assert.equal(createRes.statusCode, 201);
+    const createBody = JSON.parse(createRes.body);
+    assert.equal(createBody.cat.clientId, 'google');
+    assert.equal(createBody.cat.mcpSupport, false);
+    assert.deepEqual(createBody.cat.cli, {
+      command: 'gemini',
+      outputFormat: 'stream-json',
+    });
+
+    let runtimeCatalog = JSON.parse(readFileSync(join(projectRoot, '.cat-cafe', 'cat-catalog.json'), 'utf-8'));
+    let bananaBreed = runtimeCatalog.breeds.find((breed) => breed.catId === 'banana');
+    let bananaVariant = bananaBreed.variants.find((variant) => variant.id === bananaBreed.defaultVariantId);
+    assert.equal(bananaVariant.clientId, 'google');
+    assert.equal(bananaVariant.mcpSupport, false);
+    assert.deepEqual(bananaVariant.cli, {
+      command: 'gemini',
+      outputFormat: 'stream-json',
+    });
+
+    const patchRes = await app.inject({
+      method: 'PATCH',
+      url: '/api/cats/banana',
+      headers: {
+        'content-type': 'application/json',
+        'x-cat-cafe-user': 'codex',
+      },
+      body: JSON.stringify({
+        nickname: '香蕉猫',
+        clientId: 'google',
+        accountRef: zenmuxProfile.id,
+        defaultModel: 'google/gemini-3-pro-image-preview',
+        mcpSupport: true,
+        cli: {
+          command: 'claude',
+          outputFormat: 'stream-json',
+        },
+      }),
+    });
+
+    assert.equal(patchRes.statusCode, 200);
+    const patchBody = JSON.parse(patchRes.body);
+    assert.equal(patchBody.cat.nickname, '香蕉猫');
+    assert.equal(patchBody.cat.clientId, 'google');
+    assert.equal(patchBody.cat.mcpSupport, false);
+    assert.deepEqual(patchBody.cat.cli, {
+      command: 'gemini',
+      outputFormat: 'stream-json',
+    });
+
+    runtimeCatalog = JSON.parse(readFileSync(join(projectRoot, '.cat-cafe', 'cat-catalog.json'), 'utf-8'));
+    bananaBreed = runtimeCatalog.breeds.find((breed) => breed.catId === 'banana');
+    bananaVariant = bananaBreed.variants.find((variant) => variant.id === bananaBreed.defaultVariantId);
+    assert.equal(bananaVariant.clientId, 'google');
+    assert.equal(bananaVariant.mcpSupport, false);
+    assert.deepEqual(bananaVariant.cli, {
+      command: 'gemini',
+      outputFormat: 'stream-json',
+    });
+  });
+
   it('POST /api/cats rejects non-builtin provider bindings for google client', async () => {
     const projectRoot = createProjectRoot();
     process.env.CAT_TEMPLATE_PATH = join(projectRoot, 'cat-template.json');

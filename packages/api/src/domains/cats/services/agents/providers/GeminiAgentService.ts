@@ -17,12 +17,16 @@
  */
 
 import { spawn as nodeSpawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { basename, join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { basename, extname, join } from 'node:path';
 import { type CatId, createCatId } from '@cat-cafe/shared';
 import { getCatModel } from '../../../../../config/cat-models.js';
+import {
+  isFunctionCallingUnsupportedGeminiModel,
+  normalizeGeminiModelName,
+} from '../../../../../config/gemini-model-capabilities.js';
 import { createModuleLogger } from '../../../../../infrastructure/logger.js';
 import { formatCliExitError } from '../../../../../utils/cli-format.js';
 import { formatCliNotFoundError, resolveCliCommand } from '../../../../../utils/cli-resolve.js';
@@ -42,6 +46,9 @@ import { isKnownPostResponseCandidatesCrash, isResultErrorEvent, transformGemini
 const log = createModuleLogger('gemini-agent');
 
 type GeminiAdapter = 'gemini-cli' | 'antigravity';
+
+const GEMINI_DISABLED_MCP_SENTINEL = '__cat_cafe_no_mcp__';
+const GEMINI_IMAGE_MIME_WHITELIST = new Set(['image/png', 'image/jpeg', 'image/webp']);
 
 interface GeminiStoredThought {
   readonly subject?: string;
@@ -77,14 +84,257 @@ function formatGeminiThoughts(thoughts: readonly GeminiStoredThought[]): string 
     .join('\n\n---\n\n');
 }
 
+function sanitizePathSegment(value: string | undefined): string {
+  const trimmed = value?.trim();
+  if (!trimmed) return 'default';
+  const sanitized = trimmed.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+  return sanitized.length > 0 ? sanitized.slice(0, 48) : 'default';
+}
+
+function shouldIsolateGeminiHome(callbackEnv: Record<string, string>, model: string | undefined): boolean {
+  const hasApiKey = Boolean(callbackEnv.GEMINI_API_KEY || callbackEnv.GOOGLE_API_KEY);
+  const hasCustomEndpoint = Boolean(callbackEnv.GOOGLE_VERTEX_BASE_URL || callbackEnv.GOOGLE_GEMINI_BASE_URL);
+  return (
+    isFunctionCallingUnsupportedGeminiModel(model) ||
+    (hasApiKey && (callbackEnv.GOOGLE_GENAI_USE_VERTEXAI === 'true' || hasCustomEndpoint))
+  );
+}
+
+function normalizeGeminiCallbackEnv(callbackEnv: Record<string, string> | undefined): Record<string, string> | undefined {
+  if (!callbackEnv) return undefined;
+
+  const normalizedEnv: Record<string, string> = { ...callbackEnv };
+  const legacyBaseUrl = normalizedEnv.GEMINI_BASE_URL?.trim();
+  if (legacyBaseUrl) {
+    normalizedEnv.GOOGLE_VERTEX_BASE_URL ??= legacyBaseUrl;
+    normalizedEnv.GOOGLE_GENAI_USE_VERTEXAI ??= 'true';
+  }
+  const vertexBaseUrl = normalizedEnv.GOOGLE_VERTEX_BASE_URL?.trim();
+  if (vertexBaseUrl && !normalizedEnv.GOOGLE_GENAI_API_VERSION) {
+    // Gemini CLI defaults Vertex API calls to v1beta1, but ZenMux-style
+    // Vertex gateways expose the GA v1 path.
+    normalizedEnv.GOOGLE_GENAI_API_VERSION = 'v1';
+  }
+  return normalizedEnv;
+}
+
+function resolveGeminiHome(
+  callbackEnv: Record<string, string>,
+  catId: CatId,
+  workingDirectory?: string,
+  model?: string,
+): string | null {
+  if (!shouldIsolateGeminiHome(callbackEnv, model)) return null;
+
+  const endpoint = callbackEnv.GOOGLE_VERTEX_BASE_URL ?? callbackEnv.GOOGLE_GEMINI_BASE_URL ?? 'default-endpoint';
+  const mode = isFunctionCallingUnsupportedGeminiModel(model) ? 'no-tools' : 'default';
+  const scope = `${catId}:${workingDirectory ?? ''}:${endpoint}:${normalizeGeminiModelName(model)}:${mode}`;
+  const hash = createHash('sha256').update(scope).digest('hex').slice(0, 12);
+  const catSegment = sanitizePathSegment(String(catId));
+  const projectSegment = sanitizePathSegment(workingDirectory ? basename(workingDirectory) : undefined);
+  const isolatedHome = join(tmpdir(), `cat-cafe-gemini-home-${catSegment}-${projectSegment}-${hash}`);
+  mkdirSync(join(isolatedHome, '.gemini', 'tmp'), { recursive: true });
+  return isolatedHome;
+}
+
+function ensureImageModelGeminiSettings(homeRoot: string, model: string): void {
+  const geminiDir = join(homeRoot, '.gemini');
+  const settingsPath = join(geminiDir, 'settings.json');
+  mkdirSync(geminiDir, { recursive: true });
+
+  let settings: Record<string, unknown> = {};
+  if (existsSync(settingsPath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(settingsPath, 'utf8')) as Record<string, unknown>;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        settings = parsed;
+      }
+    } catch {
+      // Overwrite malformed settings in isolated HOME with a deterministic profile.
+    }
+  }
+
+  const tools =
+    settings.tools && typeof settings.tools === 'object' && !Array.isArray(settings.tools)
+      ? ({ ...(settings.tools as Record<string, unknown>) } as Record<string, unknown>)
+      : {};
+  tools.core = [];
+  const exclude = Array.isArray(tools.exclude) ? [...tools.exclude] : [];
+  for (const toolName of ['activate_skill', 'run_shell_command']) {
+    if (!exclude.includes(toolName)) exclude.push(toolName);
+  }
+  tools.exclude = exclude;
+  settings.tools = tools;
+
+  const experimental =
+    settings.experimental && typeof settings.experimental === 'object' && !Array.isArray(settings.experimental)
+      ? ({ ...(settings.experimental as Record<string, unknown>) } as Record<string, unknown>)
+      : {};
+  experimental.enableAgents = false;
+  settings.experimental = experimental;
+
+  // Gemini CLI falls back to `chat-base` alias for unknown chat models, which
+  // injects `thinkingConfig: { includeThoughts: true }`.  Image-generation
+  // models reject thinking entirely (400).  Defining a custom alias for the
+  // model prevents the chat-base fallback and keeps thinkingConfig out of the
+  // API request.
+  const noThinkingAlias = {
+    modelConfig: {
+      model,
+      generateContentConfig: { temperature: 0.7, topP: 0.95 },
+    },
+  };
+  const modelConfigs =
+    settings.modelConfigs && typeof settings.modelConfigs === 'object' && !Array.isArray(settings.modelConfigs)
+      ? ({ ...(settings.modelConfigs as Record<string, unknown>) } as Record<string, unknown>)
+      : {};
+  const customAliases =
+    modelConfigs.customAliases && typeof modelConfigs.customAliases === 'object' && !Array.isArray(modelConfigs.customAliases)
+      ? ({ ...(modelConfigs.customAliases as Record<string, unknown>) } as Record<string, unknown>)
+      : {};
+  customAliases[model] = noThinkingAlias;
+  // Also register the bare model name (without provider prefix) so resolution
+  // matches regardless of how the CLI normalises the `--model` value.
+  const bare = normalizeGeminiModelName(model);
+  if (bare && bare !== model) {
+    customAliases[bare] = { ...noThinkingAlias, modelConfig: { ...noThinkingAlias.modelConfig, model } };
+  }
+  modelConfigs.customAliases = customAliases;
+  settings.modelConfigs = modelConfigs;
+
+  const skills =
+    settings.skills && typeof settings.skills === 'object' && !Array.isArray(settings.skills)
+      ? ({ ...(settings.skills as Record<string, unknown>) } as Record<string, unknown>)
+      : {};
+  skills.enabled = false;
+  settings.skills = skills;
+
+  const admin =
+    settings.admin && typeof settings.admin === 'object' && !Array.isArray(settings.admin)
+      ? ({ ...(settings.admin as Record<string, unknown>) } as Record<string, unknown>)
+      : {};
+  const adminSkills =
+    admin.skills && typeof admin.skills === 'object' && !Array.isArray(admin.skills)
+      ? ({ ...(admin.skills as Record<string, unknown>) } as Record<string, unknown>)
+      : {};
+  adminSkills.enabled = false;
+  admin.skills = adminSkills;
+  settings.admin = admin;
+
+  writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
+}
+
+interface GeminiCliRuntimeConfig {
+  readonly env: Record<string, string>;
+  readonly extraArgs: readonly string[];
+}
+
+function buildGeminiCliRuntimeConfig(
+  callbackEnv: Record<string, string> | undefined,
+  catId: CatId,
+  model: string,
+  workingDirectory?: string,
+): GeminiCliRuntimeConfig | undefined {
+  const normalizedEnv = normalizeGeminiCallbackEnv(callbackEnv);
+  if (!normalizedEnv) return undefined;
+
+  const isolatedHome = resolveGeminiHome(normalizedEnv, catId, workingDirectory, model);
+  if (!isolatedHome) {
+    return { env: normalizedEnv, extraArgs: [] };
+  }
+
+  normalizedEnv.HOME = isolatedHome;
+  if (process.platform === 'win32') {
+    normalizedEnv.USERPROFILE = isolatedHome;
+  }
+  normalizedEnv.GOOGLE_GENAI_USE_GCA = 'false';
+  normalizedEnv.CLOUD_SHELL = 'false';
+  normalizedEnv.GEMINI_CLI_USE_COMPUTE_ADC = 'false';
+
+  const extraArgs: string[] = [];
+  if (isFunctionCallingUnsupportedGeminiModel(model)) {
+    // Vertex image-generation models reject function calling, so Gemini CLI
+    // must run as a plain model client instead of the default agent profile.
+    ensureImageModelGeminiSettings(isolatedHome, model);
+    extraArgs.push('--extensions', 'none', '--allowed-mcp-server-names', GEMINI_DISABLED_MCP_SENTINEL);
+  }
+
+  return { env: normalizedEnv, extraArgs };
+}
+
+function inferGeminiInlineMimeType(imagePath: string): string | null {
+  switch (extname(imagePath).toLowerCase()) {
+    case '.png':
+      return 'image/png';
+    case '.jpg':
+    case '.jpeg':
+      return 'image/jpeg';
+    case '.webp':
+      return 'image/webp';
+    default:
+      return null;
+  }
+}
+
+function buildGeminiImagePromptParts(prompt: string, imagePaths: readonly string[]): Array<Record<string, unknown>> {
+  const parts: Array<Record<string, unknown>> = [];
+  const trimmedPrompt = prompt.trim();
+  if (trimmedPrompt.length > 0) {
+    parts.push({ text: trimmedPrompt });
+  }
+
+  for (const imagePath of imagePaths) {
+    const mimeType = inferGeminiInlineMimeType(imagePath);
+    if (!mimeType) continue;
+    try {
+      const data = readFileSync(imagePath).toString('base64');
+      parts.push({ inlineData: { mimeType, data } });
+    } catch {
+      // Fall back to prompt-only generation if a local image cannot be read.
+    }
+  }
+
+  return parts.length > 0 ? parts : [{ text: prompt }];
+}
+
+function extractGeminiUsageMetadata(raw: unknown): TokenUsage | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined;
+  const usage = raw as Record<string, unknown>;
+  const tokenUsage: TokenUsage = {};
+  if (typeof usage.totalTokenCount === 'number') tokenUsage.totalTokens = usage.totalTokenCount;
+  if (typeof usage.promptTokenCount === 'number') tokenUsage.inputTokens = usage.promptTokenCount;
+  if (typeof usage.candidatesTokenCount === 'number') tokenUsage.outputTokens = usage.candidatesTokenCount;
+  if (typeof usage.cachedContentTokenCount === 'number') tokenUsage.cacheReadTokens = usage.cachedContentTokenCount;
+  return Object.keys(tokenUsage).length > 0 ? tokenUsage : undefined;
+}
+
+function buildGeminiImageRichBlock(catId: CatId, imageItems: Array<{ url: string; alt: string }>): AgentMessage {
+  return {
+    type: 'system_info',
+    catId,
+    content: JSON.stringify({
+      type: 'rich_block',
+      block: {
+        id: `gemini-img-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        kind: 'media_gallery',
+        v: 1,
+        title: 'gemini:image-generation',
+        items: imageItems,
+      },
+    }),
+    timestamp: Date.now(),
+  };
+}
+
 function readGeminiThinkingFromLocalSession(
   sessionId: string | undefined,
   assistantText: string,
   workingDirectory?: string,
+  homeRoot?: string,
 ): string | null {
   if (!sessionId) return null;
 
-  const geminiTmpRoot = join(homedir(), '.gemini', 'tmp');
+  const geminiTmpRoot = join(homeRoot ?? homedir(), '.gemini', 'tmp');
   if (!existsSync(geminiTmpRoot)) return null;
 
   const preferredProjectDir = workingDirectory ? basename(workingDirectory) : null;
@@ -156,6 +406,8 @@ interface GeminiAgentServiceOptions {
   antigravitySpawnFn?: typeof nodeSpawn;
   /** Override adapter selection (default: GEMINI_ADAPTER env or 'gemini-cli') */
   adapter?: GeminiAdapter;
+  /** Inject fetch for direct Vertex image-generation path */
+  fetchFn?: typeof fetch;
 }
 
 /**
@@ -168,12 +420,14 @@ export class GeminiAgentService implements AgentService {
   private readonly model: string;
   private readonly antigravitySpawnFn: typeof nodeSpawn;
   private readonly adapter: GeminiAdapter;
+  private readonly fetchFn: typeof fetch;
   constructor(options?: GeminiAgentServiceOptions) {
     this.catId = options?.catId ?? createCatId('gemini');
     this.model = options?.model ?? getCatModel(this.catId as string);
     this.spawnFn = options?.spawnFn;
     this.antigravitySpawnFn = options?.antigravitySpawnFn ?? nodeSpawn;
     this.adapter = options?.adapter ?? (process.env.GEMINI_ADAPTER as GeminiAdapter | undefined) ?? 'gemini-cli';
+    this.fetchFn = options?.fetchFn ?? fetch;
   }
 
   async *invoke(prompt: string, options?: AgentServiceOptions): AsyncIterable<AgentMessage> {
@@ -187,6 +441,7 @@ export class GeminiAgentService implements AgentService {
   private async *invokeGeminiCLI(prompt: string, options?: AgentServiceOptions): AsyncIterable<AgentMessage> {
     const effectiveModel = options?.callbackEnv?.CAT_CAFE_GEMINI_MODEL_OVERRIDE ?? this.model;
     const metadata: MessageMetadata = { provider: 'google', model: effectiveModel };
+    const isImageGenerationModel = isFunctionCallingUnsupportedGeminiModel(effectiveModel);
 
     // Gemini CLI has no system prompt flag; prepend identity to prompt text
     let effectivePrompt = options?.systemPrompt ? `${options.systemPrompt}\n\n${prompt}` : prompt;
@@ -197,12 +452,21 @@ export class GeminiAgentService implements AgentService {
     // and include image directories for tool access.
     effectivePrompt = appendLocalImagePathHints(effectivePrompt, imagePaths);
 
+    if (isImageGenerationModel) {
+      yield* this.invokeGeminiImageApi(effectivePrompt, effectiveModel, metadata, imagePaths, options);
+      return;
+    }
+
     // Gemini CLI supports UUID session resume in headless mode:
     //   gemini --resume <sessionId> -p "<prompt>" -o stream-json
     // Prefer resume when sessionId is available so Gemini follows the same
     // session semantics as Claude/Codex (session-chain + self-heal).
-    const modelArgs = ['--model', effectiveModel];
-    const args: string[] = options?.sessionId
+    const cliRuntime = buildGeminiCliRuntimeConfig(options?.callbackEnv, this.catId, effectiveModel, options?.workingDirectory);
+    const modelArgs = ['--model', effectiveModel, ...(cliRuntime?.extraArgs ?? [])];
+    // Vertex image-generation models break when old tool-call history is
+    // replayed, and Gemini CLI persists tool responses verbatim (including
+    // functionResponse.id). Force fresh sessions for these models.
+    const args: string[] = options?.sessionId && !isImageGenerationModel
       ? ['--resume', options?.sessionId!, ...modelArgs, '-p', effectivePrompt, '-o', 'stream-json', '-y']
       : [...modelArgs, '-p', effectivePrompt, '-o', 'stream-json', '-y'];
     for (const dir of imageAccessDirs) {
@@ -231,7 +495,7 @@ export class GeminiAgentService implements AgentService {
         command: geminiCommand,
         args,
         ...(options?.workingDirectory ? { cwd: options.workingDirectory } : {}),
-        ...(options?.callbackEnv ? { env: options.callbackEnv } : {}),
+        ...(cliRuntime ? { env: cliRuntime.env } : {}),
         ...(options?.signal ? { signal: options.signal } : {}),
         ...(options?.invocationId ? { invocationId: options.invocationId } : {}),
         ...(options?.cliSessionId ? { cliSessionId: options.cliSessionId } : {}),
@@ -357,6 +621,7 @@ export class GeminiAgentService implements AgentService {
         metadata.sessionId,
         fullAssistantText,
         options?.workingDirectory,
+        cliRuntime?.env.HOME,
       );
       if (thinking) {
         yield {
@@ -380,6 +645,129 @@ export class GeminiAgentService implements AgentService {
       // Guarantee done after error so invoke-single-cat can set isFinal correctly
       yield { type: 'done', catId: this.catId, metadata, timestamp: Date.now() };
     }
+  }
+
+  private async *invokeGeminiImageApi(
+    prompt: string,
+    effectiveModel: string,
+    metadata: MessageMetadata,
+    imagePaths: readonly string[],
+    options?: AgentServiceOptions,
+  ): AsyncIterable<AgentMessage> {
+    const normalizedEnv = normalizeGeminiCallbackEnv(options?.callbackEnv);
+    const apiKey = normalizedEnv?.GOOGLE_API_KEY?.trim() || normalizedEnv?.GEMINI_API_KEY?.trim();
+    const vertexBaseUrl = normalizedEnv?.GOOGLE_VERTEX_BASE_URL?.trim();
+    const apiVersion = normalizedEnv?.GOOGLE_GENAI_API_VERSION?.trim() || 'v1';
+
+    if (!apiKey || !vertexBaseUrl) {
+      yield {
+        type: 'error',
+        catId: this.catId,
+        error: 'Gemini image-generation models require GOOGLE_API_KEY/GEMINI_API_KEY and GOOGLE_VERTEX_BASE_URL.',
+        metadata,
+        timestamp: Date.now(),
+      };
+      yield { type: 'done', catId: this.catId, metadata, timestamp: Date.now() };
+      return;
+    }
+
+    const sessionId = `vertex-image-${randomUUID()}`;
+    metadata.sessionId = sessionId;
+    yield {
+      type: 'session_init',
+      catId: this.catId,
+      sessionId,
+      ephemeralSession: true,
+      metadata,
+      timestamp: Date.now(),
+    };
+
+    const modelName = normalizeGeminiModelName(effectiveModel);
+    const requestUrl = `${vertexBaseUrl.replace(/\/+$/, '')}/${apiVersion}/publishers/google/models/${modelName}:generateContent`;
+    const requestBody = {
+      contents: [{ role: 'user', parts: buildGeminiImagePromptParts(prompt, imagePaths) }],
+      generationConfig: {
+        responseModalities: ['TEXT', 'IMAGE'],
+        temperature: 0.7,
+        topP: 0.95,
+      },
+    };
+
+    try {
+      const response = await this.fetchFn(requestUrl, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-goog-api-key': apiKey,
+        },
+        body: JSON.stringify(requestBody),
+        signal: options?.signal,
+      });
+
+      if (!response.ok) {
+        const body = await response.text().catch(() => '');
+        throw new Error(`Vertex image API error ${response.status}: ${body.trim() || response.statusText}`);
+      }
+
+      const payload = (await response.json()) as Record<string, unknown>;
+      metadata.usage = extractGeminiUsageMetadata(payload.usageMetadata);
+
+      const candidates = Array.isArray(payload.candidates) ? (payload.candidates as Array<Record<string, unknown>>) : [];
+      const parts = candidates.flatMap((candidate) => {
+        const content = candidate.content;
+        if (typeof content !== 'object' || content === null) return [];
+        const candidateParts = (content as Record<string, unknown>).parts;
+        return Array.isArray(candidateParts) ? (candidateParts as Array<Record<string, unknown>>) : [];
+      });
+
+      const textChunks = parts
+        .map((part) => (typeof part.text === 'string' ? part.text.trim() : ''))
+        .filter((chunk) => chunk.length > 0);
+      if (textChunks.length > 0) {
+        yield {
+          type: 'text',
+          catId: this.catId,
+          content: textChunks.join('\n\n'),
+          metadata,
+          timestamp: Date.now(),
+        };
+      }
+
+      const imageItems = parts
+        .map((part) => {
+          const inlineData = part.inlineData;
+          if (typeof inlineData !== 'object' || inlineData === null) return null;
+          const typedInlineData = inlineData as Record<string, unknown>;
+          const mimeType = typeof typedInlineData.mimeType === 'string' ? typedInlineData.mimeType : '';
+          const data = typeof typedInlineData.data === 'string' ? typedInlineData.data : '';
+          if (!GEMINI_IMAGE_MIME_WHITELIST.has(mimeType) || data.length === 0) return null;
+          return { url: `data:${mimeType};base64,${data}`, alt: 'Gemini generated image' };
+        })
+        .filter((item): item is { url: string; alt: string } => item !== null);
+      if (imageItems.length > 0) {
+        yield { ...buildGeminiImageRichBlock(this.catId, imageItems), metadata };
+      }
+
+      if (textChunks.length === 0 && imageItems.length === 0) {
+        yield {
+          type: 'error',
+          catId: this.catId,
+          error: 'Gemini image API returned no text or image parts.',
+          metadata,
+          timestamp: Date.now(),
+        };
+      }
+    } catch (err) {
+      yield {
+        type: 'error',
+        catId: this.catId,
+        error: err instanceof Error ? err.message : String(err),
+        metadata,
+        timestamp: Date.now(),
+      };
+    }
+
+    yield { type: 'done', catId: this.catId, metadata, timestamp: Date.now() };
   }
 
   private async *invokeAntigravity(prompt: string, options?: AgentServiceOptions): AsyncIterable<AgentMessage> {
